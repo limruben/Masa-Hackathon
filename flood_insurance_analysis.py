@@ -15,10 +15,13 @@ This script:
 
 import sys
 import os
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -29,6 +32,7 @@ FINAL_DATASET_FILE = "final_dataset.csv"
 OUTPUT_CSV = "merged_flood_insurance_dataset.csv"
 OUTPUT_PLOT = "insured_damage_over_time.png"
 CORRELATION_PLOT = "correlation_heatmap.png"
+CO2_FORECAST_PLOT = "co2_forecast_2025.png"
 
 COUNTRIES_ISO = {"IDN": "Indonesia", "MYS": "Malaysia"}
 INSURED_DAMAGE_COL = "Insured Damage ('000 US$)"
@@ -309,6 +313,256 @@ def save_merged_dataset(merged_df: pd.DataFrame, output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 8. CO2 emissions prediction model
+# ---------------------------------------------------------------------------
+
+# Indicator codes used in the CO2 prediction model
+_CO2_TARGET_IND = "WB_WDI_EN_GHG_CO2_MT_CE_AR5"
+_CO2_GDP_IND = "WB_WDI_NY_ADJ_DCO2_CD"
+_CO2_DEFOREST_IND = "WB_WDI_EN_GHG_CO2_LU_DF_MT_CE_AR5"
+
+# Human-readable column names after pivoting
+_COL_CO2 = "CO2_emissions"
+_COL_GDP = "GDP_proxy"
+_COL_DEFOREST = "Deforestation_CO2"
+
+_TRAIN_YEARS = (2003, 2018)
+_VAL_YEARS = (2019, 2023)
+_FORECAST_YEAR = 2025
+_COUNTRIES = ["Indonesia", "Malaysia"]
+
+
+def build_co2_prediction_model(final_df: pd.DataFrame) -> dict:
+    """Train a linear regression model to predict total CO2 emissions per country.
+
+    Uses three WDI indicators from ``final_df`` (long format with columns
+    Country, Year, INDICATOR, WDI_Value):
+
+    * ``WB_WDI_EN_GHG_CO2_MT_CE_AR5``  – total CO2 emissions (target)
+    * ``WB_WDI_NY_ADJ_DCO2_CD``        – adjusted net national income / GDP proxy
+    * ``WB_WDI_EN_GHG_CO2_LU_DF_MT_CE_AR5`` – CO2 from deforestation
+
+    For each of Indonesia and Malaysia the function:
+
+    1. Pivots the filtered long-format data to wide (one column per indicator).
+    2. Splits into training (``_TRAIN_YEARS``) and validation (``_VAL_YEARS``) sets.
+    3. Fits a ``LinearRegression`` model with predictors Year, GDP_proxy, and
+       Deforestation_CO2.
+    4. Prints model coefficients and RMSE on the validation set.
+    5. Forecasts CO2 for ``_FORECAST_YEAR`` (2025) by carrying forward the last
+       available (2023) values of the predictor variables.
+    6. Saves a line plot (``CO2_FORECAST_PLOT``) with historical data, in-sample
+       fitted values, validation period actuals, and the 2025 forecast with a
+       shaded prediction interval derived from the residual standard error.
+
+    Parameters
+    ----------
+    final_df:
+        Long-format DataFrame loaded from ``final_dataset.csv``.
+
+    Returns
+    -------
+    dict
+        ``{country_name: forecasted_CO2_2025}`` for each country processed.
+        Countries with insufficient data are omitted from the dictionary.
+    """
+    # ---- Step 1: filter to the three indicator codes and pivot ----
+    indicators = [_CO2_TARGET_IND, _CO2_GDP_IND, _CO2_DEFOREST_IND]
+    col_map = {
+        _CO2_TARGET_IND: _COL_CO2,
+        _CO2_GDP_IND: _COL_GDP,
+        _CO2_DEFOREST_IND: _COL_DEFOREST,
+    }
+
+    filtered = final_df[final_df["INDICATOR"].isin(indicators)].copy()
+
+    if filtered.empty:
+        print(
+            "\n  Warning: None of the CO2 indicator codes were found in final_dataset. "
+            "Skipping CO2 prediction model."
+        )
+        return {}
+
+    pivot = filtered.pivot_table(
+        index=["Country", "Year"],
+        columns="INDICATOR",
+        values="WDI_Value",
+        aggfunc="first",
+    ).reset_index()
+    pivot.columns.name = None
+    pivot = pivot.rename(columns=col_map)
+    pivot["Year"] = pivot["Year"].astype(int)
+
+    predictors = ["Year", _COL_GDP, _COL_DEFOREST]
+    target = _COL_CO2
+
+    forecasts: dict = {}
+    palette = {"Indonesia": "#1f77b4", "Malaysia": "#ff7f0e"}
+
+    fig, axes = plt.subplots(
+        1, len(_COUNTRIES), figsize=(14, 6), sharey=False
+    )
+    if len(_COUNTRIES) == 1:
+        axes = [axes]
+
+    for ax, country in zip(axes, _COUNTRIES):
+        country_df = pivot[pivot["Country"] == country].sort_values("Year").copy()
+
+        # ---- Step 2: drop rows with NaN in target or predictors ----
+        required_cols = [target] + predictors
+        available_cols = [c for c in required_cols if c in country_df.columns]
+        missing_cols = [c for c in required_cols if c not in country_df.columns]
+        if missing_cols:
+            print(
+                f"\n  Warning [{country}]: columns {missing_cols} not present. "
+                "Skipping this country."
+            )
+            ax.set_title(f"{country}\n(insufficient data)", fontsize=12)
+            ax.axis("off")
+            continue
+
+        country_df = country_df.dropna(subset=required_cols)
+
+        if len(country_df) < 5:
+            print(
+                f"\n  Warning [{country}]: only {len(country_df)} complete rows "
+                "after dropping NaNs – skipping."
+            )
+            ax.set_title(f"{country}\n(insufficient data)", fontsize=12)
+            ax.axis("off")
+            continue
+
+        # ---- Step 3: train / validation split ----
+        train_df = country_df[
+            country_df["Year"].between(_TRAIN_YEARS[0], _TRAIN_YEARS[1])
+        ]
+        val_df = country_df[
+            country_df["Year"].between(_VAL_YEARS[0], _VAL_YEARS[1])
+        ]
+
+        if train_df.empty:
+            print(
+                f"\n  Warning [{country}]: no training rows in "
+                f"{_TRAIN_YEARS[0]}–{_TRAIN_YEARS[1]} – skipping."
+            )
+            ax.set_title(f"{country}\n(insufficient training data)", fontsize=12)
+            ax.axis("off")
+            continue
+
+        X_train = train_df[predictors].values
+        y_train = train_df[target].values
+
+        # ---- Step 4: fit linear regression ----
+        model = LinearRegression()
+        model.fit(X_train, y_train)
+
+        print(f"\n{'─' * 60}")
+        print(f"CO2 Prediction Model – {country}")
+        print(f"{'─' * 60}")
+        print(f"  Intercept : {model.intercept_:.4f}")
+        for name, coef in zip(predictors, model.coef_):
+            print(f"  {name:<20}: {coef:.6f}")
+
+        if not val_df.empty:
+            X_val = val_df[predictors].values
+            y_val = val_df[target].values
+            y_val_pred = model.predict(X_val)
+            rmse = float(np.sqrt(mean_squared_error(y_val, y_val_pred)))
+            print(f"  RMSE (validation {_VAL_YEARS[0]}–{_VAL_YEARS[1]}): {rmse:.4f}")
+        else:
+            print(
+                f"  Note: no validation rows in "
+                f"{_VAL_YEARS[0]}–{_VAL_YEARS[1]} – RMSE not computed."
+            )
+
+        # ---- Step 5: forecast 2025 ────────────────────────────────────────
+        # Assumption: GDP_proxy and Deforestation_CO2 for 2025 are assumed to
+        # equal their most recently available values (2023 if present, otherwise
+        # the last observed year). This is a simplifying assumption for
+        # short-horizon extrapolation; in practice these should be projected
+        # independently.
+        last_row = country_df.iloc[-1]
+        gdp_2025 = last_row[_COL_GDP]
+        deforest_2025 = last_row[_COL_DEFOREST]
+        X_forecast = np.array([[_FORECAST_YEAR, gdp_2025, deforest_2025]])
+        co2_2025 = float(model.predict(X_forecast)[0])
+        forecasts[country] = co2_2025
+        print(f"  Forecast CO2 for {_FORECAST_YEAR}: {co2_2025:.4f} Mt CO2-eq")
+
+        # ---- Step 6 / Step 7: build plot for this country ----
+        color = palette.get(country, "steelblue")
+
+        # Compute residual standard error on training set for prediction interval
+        y_train_pred = model.predict(X_train)
+        residuals = y_train - y_train_pred
+        n = len(residuals)
+        p = len(predictors)
+        rse = float(np.sqrt(np.sum(residuals ** 2) / max(n - p - 1, 1)))
+
+        # Full fitted line over all historical years
+        X_all = country_df[predictors].values
+        y_fitted = model.predict(X_all)
+
+        ax.plot(
+            country_df["Year"],
+            country_df[target],
+            color=color,
+            linewidth=2,
+            marker="o",
+            markersize=4,
+            label="Historical CO2",
+        )
+        ax.plot(
+            country_df["Year"],
+            y_fitted,
+            color=color,
+            linewidth=1.5,
+            linestyle="--",
+            alpha=0.75,
+            label="Model fit",
+        )
+        # 2025 forecast point
+        ax.scatter(
+            [_FORECAST_YEAR],
+            [co2_2025],
+            color="red",
+            zorder=5,
+            s=80,
+            label=f"{_FORECAST_YEAR} forecast",
+        )
+        # Shaded prediction interval (±1 RSE) around the 2025 forecast
+        ax.fill_between(
+            [_FORECAST_YEAR - 0.4, _FORECAST_YEAR + 0.4],
+            [co2_2025 - rse, co2_2025 - rse],
+            [co2_2025 + rse, co2_2025 + rse],
+            color="red",
+            alpha=0.25,
+            label=f"±1 RSE ({rse:.2f})",
+        )
+        # Vertical dashed line at forecast year
+        ax.axvline(_FORECAST_YEAR, color="grey", linestyle=":", linewidth=1)
+
+        ax.set_title(f"{country}", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Year", fontsize=11)
+        ax.set_ylabel("CO2 Emissions (Mt CO2-eq)", fontsize=11)
+        ax.legend(fontsize=9)
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+    fig.suptitle(
+        f"Historical CO2 Emissions & {_FORECAST_YEAR} Forecast\n"
+        "(Linear Regression: Year + GDP proxy + Deforestation CO2)",
+        fontsize=13,
+        fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(CO2_FORECAST_PLOT, dpi=150)
+    plt.close()
+    print(f"\nCO2 forecast plot saved to '{CO2_FORECAST_PLOT}'.")
+
+    return forecasts
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -339,6 +593,16 @@ def main() -> None:
 
     # 7. Save merged dataset
     save_merged_dataset(merged_df, OUTPUT_CSV)
+
+    # 8. CO2 prediction model and 2025 forecast
+    co2_forecasts = build_co2_prediction_model(final_df)
+    if co2_forecasts:
+        print("\n" + "=" * 70)
+        print(f"CO2 Emissions Forecast for {_FORECAST_YEAR}")
+        print("=" * 70)
+        for country, value in co2_forecasts.items():
+            print(f"  {country}: {value:.4f} Mt CO2-eq")
+        print("=" * 70)
 
     print("\nDone.")
 
